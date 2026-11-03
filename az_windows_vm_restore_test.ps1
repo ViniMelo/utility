@@ -17,7 +17,13 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$TargetSubnetName,
 
+    [string]$SubscriptionId,
+
+    [string]$TenantId,
+
     [string]$RecoveryPoint = "Latest",
+
+    [datetime]$RecoveryPointDateTime,
 
     [int]$RestoreTimeoutMinutes = 120,
 
@@ -31,7 +37,6 @@ param(
 # ============================================================
 # Restore-VM-Integrity-Drill
 #
-# Azure Automation
 # PowerShell 7.4
 #
 # Purpose:
@@ -43,11 +48,59 @@ param(
 #   6. Produce JSON/HTML results
 #   7. Optionally delete restored VM
 #
-# Authentication:
-#   Automation Account Managed Identity
+# Execution model:
+#   Designed to run from a local workstation or developer laptop
+#   instead of an Azure Automation Account.
 # ============================================================
 
 $ErrorActionPreference = "Stop"
+
+function Assert-AzModule {
+    param(
+        [string[]]$ModuleNames
+    )
+
+    foreach ($ModuleName in $ModuleNames) {
+        if (-not (Get-Module -ListAvailable -Name $ModuleName)) {
+            throw "Required Az module '$ModuleName' is not installed. Install it with: Install-Module $ModuleName -Scope CurrentUser"
+        }
+    }
+}
+
+function Connect-LocalAzureContext {
+    param(
+        [string]$SubscriptionId,
+        [string]$TenantId
+    )
+
+    Disable-AzContextAutosave -Scope Process
+
+    $Context = Get-AzContext
+
+    if (-not $Context) {
+        if ($SubscriptionId) {
+            if ($TenantId) {
+                $Context = Connect-AzAccount -Subscription $SubscriptionId -Tenant $TenantId
+            }
+            else {
+                $Context = Connect-AzAccount -Subscription $SubscriptionId
+            }
+        }
+        else {
+            $Context = Connect-AzAccount
+        }
+    }
+    elseif ($SubscriptionId) {
+        Set-AzContext -SubscriptionId $SubscriptionId -Tenant $TenantId -ErrorAction Stop | Out-Null
+        $Context = Get-AzContext
+    }
+
+    if (-not $Context) {
+        throw "Unable to authenticate to Azure from this workstation."
+    }
+
+    return $Context
+}
 
 $ExecutionId = Get-Date -Format "yyyyMMdd-HHmmss"
 $ExecutionStart = Get-Date
@@ -57,23 +110,29 @@ $Results = [System.Collections.Generic.List[object]]::new()
 Write-Output "============================================================"
 Write-Output " Azure VM Restore Integrity Drill"
 Write-Output " Execution ID: $ExecutionId"
+Write-Output " Run mode: Local workstation"
 Write-Output "============================================================"
 
 # ------------------------------------------------------------
 # Authentication
 # ------------------------------------------------------------
 
-Write-Output "Authenticating using Automation Account Managed Identity..."
+Write-Output "Validating Azure PowerShell modules..."
+Assert-AzModule -ModuleNames @(
+    "Az.Accounts",
+    "Az.Compute",
+    "Az.Network",
+    "Az.RecoveryServices",
+    "Az.Resources"
+)
 
-Disable-AzContextAutosave -Scope Process
-
-$AzureContext = (Connect-AzAccount -Identity).Context
-
-if (-not $AzureContext) {
-    throw "Unable to authenticate using Managed Identity."
-}
+Write-Output "Authenticating to Azure using your local account..."
+$AzureContext = Connect-LocalAzureContext -SubscriptionId $SubscriptionId -TenantId $TenantId
 
 Write-Output "Authenticated as: $($AzureContext.Account.Id)"
+if ($AzureContext.Subscription) {
+    Write-Output "Subscription: $($AzureContext.Subscription.Name) ($($AzureContext.Subscription.Id))"
+}
 
 # ------------------------------------------------------------
 # Helper: Add result
@@ -128,13 +187,15 @@ function Get-VMBackupItem {
 }
 
 # ------------------------------------------------------------
-# Helper: Find latest recovery point
+# Helper: Select recovery point
 # ------------------------------------------------------------
 
-function Get-LatestRecoveryPoint {
+function Get-RecoveryPointForVM {
     param(
         [object]$BackupItem,
-        [object]$Vault
+        [object]$Vault,
+        [string]$PreferredRecoveryPoint,
+        [datetime]$PreferredRecoveryPointTime
     )
 
     $EndDate = Get-Date
@@ -152,9 +213,44 @@ function Get-LatestRecoveryPoint {
         throw "No recovery points found."
     }
 
-    return $RecoveryPoints |
-        Sort-Object RecoveryPointTime -Descending |
-        Select-Object -First 1
+    switch ($PreferredRecoveryPoint.ToLowerInvariant()) {
+        "latest" {
+            return $RecoveryPoints |
+                Sort-Object RecoveryPointTime -Descending |
+                Select-Object -First 1
+        }
+        "earliest" {
+            return $RecoveryPoints |
+                Sort-Object RecoveryPointTime |
+                Select-Object -First 1
+        }
+        default {
+            $TargetDate = $null
+
+            if ($PreferredRecoveryPointTime) {
+                $TargetDate = $PreferredRecoveryPointTime
+            }
+            else {
+                try {
+                    $TargetDate = [datetime]::Parse($PreferredRecoveryPoint)
+                }
+                catch {
+                    throw "RecoveryPoint '$PreferredRecoveryPoint' is not valid. Use 'Latest', 'Earliest', or a valid datetime string."
+                }
+            }
+
+            $ChosenPoint = $RecoveryPoints |
+                Where-Object { $_.RecoveryPointTime -le $TargetDate } |
+                Sort-Object RecoveryPointTime -Descending |
+                Select-Object -First 1
+
+            if (-not $ChosenPoint) {
+                throw "No recovery point found on or before '$TargetDate'."
+            }
+
+            return $ChosenPoint
+        }
+    }
 }
 
 # ------------------------------------------------------------
@@ -178,9 +274,7 @@ function Wait-ForRestoreJob {
             -VaultId $Vault.Id `
             -JobId $Job.JobId
 
-        Write-Output (
-            "Restore job status: {0}" -f $CurrentJob.Status
-        )
+        Write-Output ("Restore job status: {0}" -f $CurrentJob.Status)
 
         if ($CurrentJob.Status -in @(
             "Completed",
@@ -510,7 +604,7 @@ try {
     $Events = Get-WinEvent `
         -FilterHashtable @{
             LogName = "System"
-            Level   = 2
+            Level = 2
             StartTime = (Get-Date).AddMinutes(-15)
         } `
         -MaxEvents 10 `
@@ -645,7 +739,6 @@ foreach ($VMName in $VMNames) {
 
                     $BackupItem = $CandidateItem
                     $Vault = $CandidateVault
-
                     break
                 }
 
@@ -670,9 +763,11 @@ foreach ($VMName in $VMNames) {
         # Recovery point
         # ----------------------------------------------------
 
-        $RP = Get-LatestRecoveryPoint `
+        $RP = Get-RecoveryPointForVM `
             -BackupItem $BackupItem `
-            -Vault $Vault
+            -Vault $Vault `
+            -PreferredRecoveryPoint $RecoveryPoint `
+            -PreferredRecoveryPointTime $RecoveryPointDateTime
 
         if (-not $RP) {
             throw "No recovery point found."
@@ -1000,110 +1095,50 @@ if ($GenerateHtmlReport.IsPresent) {
 
     $HtmlReport = @"
 <!DOCTYPE html>
-
 <html>
-
 <head>
-
-<title>Azure VM Restore Drill - $ExecutionId</title>
-
-<style>
-
-body {
-    font-family: Arial, sans-serif;
-    margin: 30px;
-}
-
-table {
-    border-collapse: collapse;
-    width: 100%;
-}
-
-th, td {
-    border: 1px solid #ccc;
-    padding: 8px;
-    text-align: left;
-}
-
-th {
-    background: #eee;
-}
-
-.pass {
-    font-weight: bold;
-}
-
-.fail {
-    font-weight: bold;
-}
-
-.warning {
-    font-weight: bold;
-}
-
-</style>
-
+    <meta charset="utf-8" />
+    <title>Azure VM Restore Integrity Drill</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ccc; padding: 8px; text-align: left; vertical-align: top; }
+        th { background: #f2f2f2; }
+        .pass { color: green; font-weight: bold; }
+        .fail { color: red; font-weight: bold; }
+        .warning { color: orange; font-weight: bold; }
+        .other { color: gray; }
+    </style>
 </head>
-
 <body>
+    <h1>Azure VM Restore Integrity Drill</h1>
+    <p><strong>Execution ID:</strong> $ExecutionId</p>
+    <p><strong>Status:</strong> $OverallStatus</p>
+    <p><strong>VMs tested:</strong> $($VMNames.Count)</p>
+    <p><strong>Tests passed:</strong> $PassCount</p>
+    <p><strong>Tests failed:</strong> $FailCount</p>
+    <p><strong>Warnings:</strong> $WarningCount</p>
+    <p><strong>Duration:</strong> $($ExecutionEnd - $ExecutionStart)</p>
 
-<h1>Azure VM Restore Integrity Report</h1>
-
-<p><strong>Execution ID:</strong> $ExecutionId</p>
-
-<p><strong>Started:</strong> $ExecutionStart</p>
-
-<p><strong>Completed:</strong> $ExecutionEnd</p>
-
-<p><strong>Overall Status:</strong> $OverallStatus</p>
-
-<h2>Summary</h2>
-
-<ul>
-
-<li>VMs tested: $($VMNames.Count)</li>
-
-<li>Tests passed: $PassCount</li>
-
-<li>Tests failed: $FailCount</li>
-
-<li>Warnings: $WarningCount</li>
-
-</ul>
-
-<h2>Results</h2>
-
-<table>
-
-<tr>
-<th>VM</th>
-<th>Test</th>
-<th>Status</th>
-<th>Details</th>
-<th>Value</th>
-</tr>
-
-$($Rows -join "`n")
-
-</table>
-
+    <table>
+        <thead>
+            <tr>
+                <th>VM</th>
+                <th>Test</th>
+                <th>Status</th>
+                <th>Details</th>
+                <th>Value</th>
+            </tr>
+        </thead>
+        <tbody>
+            $Rows
+        </tbody>
+    </table>
 </body>
-
 </html>
 "@
 
-    Write-Output ""
-    Write-Output "HTML REPORT"
-    Write-Output $HtmlReport
+    $HtmlPath = Join-Path -Path (Get-Location) -ChildPath "vm-restore-integrity-$ExecutionId.html"
+    $HtmlReport | Set-Content -Path $HtmlPath -Encoding UTF8
+    Write-Output "HTML report written to: $HtmlPath"
 }
-
-# ============================================================
-# Exit
-# ============================================================
-
-if ($OverallStatus -eq "FAIL") {
-    throw "Restore drill completed with failures."
-}
-
-Write-Output ""
-Write-Output "Restore drill completed successfully."
